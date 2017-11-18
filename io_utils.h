@@ -6,6 +6,9 @@
 #include <mpi.h>
 #include <stdbool.h>
 #include <stdio.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #define X(i) (x_1 + (start_x_i + (i)) * x_step)
 #define Y(i) (y_1 + (start_y_i + (i)) * y_step)
@@ -21,6 +24,8 @@ static int proc_column = -1;
 static int proc_row = -1;
 /** Ranks of a neighbour processes. */
 static int ranks_neigh[4];
+/** Count of existing borders. */
+static int border_count = -1;
 /**
  * Each process in a global processes grid owns an XY coordinates
  * matrix. These values specifies the size of this matrix.
@@ -93,19 +98,37 @@ global_scalar_fraction(double local_numerator, double local_denominator)
 	local_buf[1] = local_denominator;
 	int rc = MPI_Allreduce(local_buf, global_buf, 2, MPI_DOUBLE, MPI_SUM,
 			       MPI_COMM_WORLD);
+	(void) rc; /* Prune warning in release mode. */
 	assert(rc == MPI_SUCCESS);
 	return global_buf[0] / global_buf[1];
 }
 
-/** Calculate global error of P using local error.*/
+/**
+ * Calculate global error and increment of P using local error and
+ * increment. Global increment is calculated by formula:
+ * || P_i+1 - P_i ||.
+ * @param local_increment Local increment of P.
+ * @param local_error Local error of P (difference with ethalon).
+ * @param[out] global_error Global error over all processes by
+ *             formula: || ethalon - P ||.
+ * @param step Grid step (step by X * step by Y).
+ *
+ * @retval Global increment.
+ */
 static inline double
-global_increment(double local_increment)
+global_increment(double local_increment, double local_error,
+		 double *global_error, double step)
 {
-	double global_increment;
-	int rc = MPI_Allreduce(&local_increment, &global_increment, 1,
-			       MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+	double local_buf[2];
+	double global_buf[2];
+	local_buf[0] = local_increment;
+	local_buf[1] = local_error;
+	int rc = MPI_Allreduce(local_buf, global_buf, 2, MPI_DOUBLE, MPI_SUM,
+			       MPI_COMM_WORLD);
+	(void) rc; /* Prune warning in release mode. */
 	assert(rc == MPI_SUCCESS);
-	return sqrt(global_increment);
+	*global_error = sqrt(global_buf[1] * step);
+	return sqrt(global_buf[0] * step);
 }
 
 /**
@@ -117,8 +140,8 @@ global_increment(double local_increment)
 static inline void
 send_borders(double *matrix)
 {
-	MPI_Request req;
 	for (int i = 0; i < 4; ++i) {
+		MPI_Request req;
 		if (ranks_neigh[i] == -1)
 			continue;
 		double *to_send;
@@ -142,6 +165,7 @@ send_borders(double *matrix)
 		int size = border_size[i];
 		int rc = MPI_Isend(to_send, size, MPI_DOUBLE, ranks_neigh[i], i,
 				   MPI_COMM_WORLD, &req);
+		(void) rc; /* Prune warning in release mode. */
 		assert(rc == MPI_SUCCESS);
 		MPI_Request_free(&req);
 	}
@@ -173,6 +197,7 @@ receive_borders(double **borders, MPI_Request *reqs)
 		int size = border_size[i];
 		int rc = MPI_Irecv(borders[i], size, MPI_DOUBLE, ranks_neigh[i],
 				   type_from, MPI_COMM_WORLD, &reqs[i]);
+		(void) rc; /* Prune warning in release mode. */
 		assert(rc == MPI_SUCCESS);
 	}
 }
@@ -190,6 +215,7 @@ static inline void
 sync_receive_borders(MPI_Request *reqs, int count)
 {
 	int rc = MPI_Waitall(count, reqs, MPI_STATUSES_IGNORE);
+	(void) rc; /* Prune warning in release mode. */
 	assert(rc == MPI_SUCCESS);
 }
 
@@ -276,15 +302,24 @@ calculate_cells(int table_height, int table_width, int proc_count)
 	if (proc_column + 1 > col_points_rest)
 		start_x_i += col_points_rest;
 
-	if (proc_row + 1 == rows)
+	border_count = 4;
+	if (proc_row + 1 == rows) {
 		is_top = true;
-	if (proc_row == 0)
+		--border_count;
+	}
+	if (proc_row == 0) {
 		is_bottom = true;
+		--border_count;
+	}
 
-	if (proc_column == 0)
+	if (proc_column == 0) {
 		is_left = true;
-	if (proc_column + 1 == cols)
+		--border_count;
+	}
+	if (proc_column + 1 == cols) {
 		is_right = true;
+		--border_count;
+	}
 
 	if (! is_top) {
 		ranks_neigh[TOP_BORDER] = proc_rank + cols;
