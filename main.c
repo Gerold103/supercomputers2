@@ -66,6 +66,13 @@ phi(double x, double y)
 	return t1 * t1 + t2 * t2;
 }
 
+/** Analitycal decision of the task. Used to calculate error. */
+static inline double
+ethalon(double x, double y)
+{
+	return phi(x, y);
+}
+
 static inline double
 F(double x, double y)
 {
@@ -148,6 +155,7 @@ laplas_5(double *matrix, int row, int col, double **borders)
 static inline void
 laplas_5_matrix(double *src, double **src_borders, double *dst)
 {
+	#pragma omp parallel for
 	for (int i = first_internal_row; i <= last_internal_row; ++i) {
 		for (int j = first_internal_col; j <= last_internal_col; ++j)
 			set_cell(dst, i, j, -laplas_5(src, i, j, src_borders));
@@ -165,6 +173,7 @@ static inline double
 local_scalar(double *a, double *b)
 {
 	double ret = 0;
+	#pragma omp parallel for reduction(+:ret)
 	for (int i = first_internal_row; i <= last_internal_row; ++i) {
 		for (int j = first_internal_col; j <= last_internal_col; ++j)
 			ret += get_cell(a, i, j) * get_cell(b, i, j);
@@ -180,12 +189,14 @@ local_scalar(double *a, double *b)
 static inline void
 calculate_next_G(double alpha)
 {
+	#pragma omp parallel for
 	for (int i = 0; i < cell_rows; ++i) {
 		for (int j = 0; j < cell_cols; ++j) {
 			set_cell(G, i, j, get_cell(R, i, j) -
 				 alpha * get_cell(G, i, j));
 		}
 	}
+	#pragma omp parallel for
 	for (int i = 0; i < 4; ++i) {
 		if (G_neigh[i] == NULL)
 			continue;
@@ -203,6 +214,7 @@ calculate_next_G(double alpha)
  * @param discrepancy_matrix R on step 1 and G on other steps.
  * @param discrepancy_borders Neighbour processes borders of
  *        @a discrepancy_matrix.
+ * @param[out] out_error Local error of a new P.
  *
  * @retval Difference between old and new P for a local process.
  *         Calculated using formula:
@@ -211,30 +223,36 @@ calculate_next_G(double alpha)
  */
 static inline double
 calculate_next_P(double tau, double *discrepancy_matrix,
-		 double **discrepancy_borders)
+		 double **discrepancy_borders, double *out_error)
 {
+	double error = 0;
 	double increment = 0;
+	#pragma omp parallel for reduction(+:increment, error)
 	for (int i = 0; i < cell_rows; ++i) {
 		for (int j = 0; j < cell_cols; ++j) {
 			double old = get_cell(P, i, j);
 			set_cell(P, i, j, old -
 				 tau * get_cell(discrepancy_matrix, i, j));
-			double local_increment = get_cell(P, i, j) - old;
-			increment += local_increment * local_increment;
+			if (i >= first_internal_row && i <= last_internal_row &&
+			    j >= first_internal_col && j <= last_internal_col) {
+				double cell = get_cell(P, i, j);
+				double local_increment = cell - old;
+				increment += local_increment * local_increment;
+				double local_error = cell - ethalon(X(j), Y(i));
+				error += local_error * local_error;
+			}
 		}
 	}
+	#pragma omp parallel for
 	for (int i = 0; i < 4; ++i) {
 		if (P_neigh[i] == NULL)
 			continue;
 		assert(discrepancy_borders[i] != NULL);
 		int count = border_size[i];
-		for (int j = 0; j < count; ++j) {
-			double old = P_neigh[i][j];
+		for (int j = 0; j < count; ++j)
 			P_neigh[i][j] -= tau * discrepancy_borders[i][j];
-			double local_increment = P_neigh[i][j] - old;
-			increment += local_increment * local_increment;
-		}
 	}
+	*out_error = error;
 	return increment;
 }
 
@@ -246,27 +264,44 @@ calculate_next_P(double tau, double *discrepancy_matrix,
 static inline void
 calculate_next_R()
 {
+	#pragma omp parallel for
 	for (int i = first_internal_row; i <= last_internal_row; ++i) {
 		for (int j = first_internal_col; j <= last_internal_col; ++j) {
-			set_cell(R, i, j, -laplas_5(P, i, j, P_neigh)
-				 - F(X(j), Y(i)));
+			set_cell(R, i, j, -laplas_5(P, i, j, P_neigh) -
+				 F(X(j), Y(i)));
 		}
 	}
-	if (is_bottom) {
-		for (int i = 0; i < cell_cols; ++i)
-			set_cell(R, 0, i, 0);
-	}
-	if (is_top) {
-		for (int i = 0; i < cell_cols; ++i)
-			set_cell(R, cell_rows - 1, i, 0);
-	}
-	if (is_left) {
-		for (int i = 0; i < cell_rows; ++i)
-			set_cell(R, i, 0, 0);
-	}
-	if (is_right) {
-		for (int i = 0; i < cell_rows; ++i)
-			set_cell(R, i, cell_cols - 1, 0);
+	#pragma omp parallel if (border_count <= 2)
+	#pragma omp sections
+	{
+		#pragma omp section
+		{
+			if (is_bottom) {
+				for (int i = 0; i < cell_cols; ++i)
+					set_cell(R, 0, i, 0);
+			}
+		}
+		#pragma omp section
+		{
+			if (is_top) {
+				for (int i = 0; i < cell_cols; ++i)
+					set_cell(R, cell_rows - 1, i, 0);
+			}
+		}
+		#pragma omp section
+		{
+			if (is_left) {
+				for (int i = 0; i < cell_rows; ++i)
+					set_cell(R, i, 0, 0);
+			}
+		}
+		#pragma omp section
+		{
+			if (is_right) {
+				for (int i = 0; i < cell_rows; ++i)
+					set_cell(R, i, cell_cols - 1, 0);
+			}
+		}
 	}
 }
 
@@ -339,6 +374,7 @@ create_matrices()
 		last_internal_col = cell_cols - 2;
 	else
 		last_internal_col = cell_cols - 1;
+	#pragma omp parallel for
 	for (int i = first_internal_row; i <= last_internal_row; ++i) {
 		for (int j = first_internal_col; j <= last_internal_col; ++j) {
 			set_cell(R, i, j, -laplas_5(P, i, j, P_neigh) -
@@ -366,8 +402,10 @@ calculate()
 	double tau = global_scalar_fraction(numerator, denominator);
 
 	/* Calculate error. */
-	double local_inc = calculate_next_P(tau, R, R_neigh);
-	double global_inc = global_increment(local_inc);
+	double local_error, global_error;
+	double local_inc = calculate_next_P(tau, R, R_neigh, &local_error);
+	double global_inc = global_increment(local_inc, local_error,
+					     &global_error, x_step * y_step);
 	if (proc_rank == 0)
 		printf("global_increment = %lf\n", global_inc);
 
@@ -425,10 +463,14 @@ calculate()
 		double tau = global_scalar_fraction(numerator, denominator);
 
 		/* (5) */
-		double local_inc = calculate_next_P(tau, G, G_neigh);
-		global_inc = global_increment(local_inc);
-		if (proc_rank == 0 && iterations_count % 10 == 0)
-			printf("global_increment = %lf\n", global_inc);
+		double local_inc = calculate_next_P(tau, G, G_neigh,
+						    &local_error);
+		global_inc = global_increment(local_inc, local_error,
+					      &global_error, x_step * y_step);
+		if (proc_rank == 0 && iterations_count % 10 == 0) {
+			printf("global_increment = %lf, global_error = %lf\n",
+			       global_inc, global_error);
+		}
 	}
 	printf("finished in %d iterations\n", iterations_count);
 }
@@ -525,20 +567,35 @@ main(int argc, char **argv)
 	y_step = (y_2 - y_1) / (table_height - 1);
 	h1_in_2_reverted = 1 / (x_step * x_step);
 	h2_in_2_reverted = 1 / (y_step * y_step);
-
+	double start_time = 0, end_time = 0;
+#ifdef _OPENMP
+	omp_set_dynamic(0);
+	omp_set_num_threads(3);
+#endif
 	MPI_Init(&argc, &argv);
 	MPI_Comm_rank(MPI_COMM_WORLD, &proc_rank);
 	int proc_count;
 	MPI_Comm_size(MPI_COMM_WORLD, &proc_count);
+#ifdef _OPENMP
+	if (proc_rank == 0) {
+                int threads_detected = 0;
+                #pragma omp parallel
+                {
+                        #pragma omp atomic
+                        threads_detected++;
+                }
+                printf("Detected threads = %d\n", threads_detected);
+        }
+#endif
 	if (calculate_cells(table_height, table_width, proc_count) != 0) {
 		printf("Cannot split table in a specified process count\n");
 		goto error;
 	}
 	create_matrices();
 
-	double start_time = MPI_Wtime();
+	start_time = MPI_Wtime();
 	calculate();
-	double end_time = MPI_Wtime();
+	end_time = MPI_Wtime();
 	if (proc_rank == 0)
 		printf("time = %lf\n", end_time - start_time);
 
