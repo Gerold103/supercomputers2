@@ -1,12 +1,6 @@
-all: clean main.c
-	mpicc main.c -DNDEBUG -g -std=c99 -Wall -openmp -o main
-
-no_omp: clean main.c
-	mpicc main.c -DNDEBUG -g -std=c99 -Wall -Wno-unknown-pragmas -o main
+all: clean main.c cuda_utils.cu
+	nvcc -rdc=true -arch=sm_20 -ccbin mpicxx main.c cuda_utils.cu -Xcompiler -std=c99 -Xcompiler -O3 -Xcompiler -DNDEBUG -Xcompiler -g -Xcompiler -Wall -o main
 
 clean:
 	rm -rf main.dSYM*
 	rm -rf main
-	rm -rf P_vers*
-	rm -rf R_vers*
-	rm -rf G_vers*

@@ -6,12 +6,7 @@
 #include <mpi.h>
 #include <stdbool.h>
 #include <stdio.h>
-#ifdef _OPENMP
-#include <omp.h>
-#endif
-
-#define X(i) (x_1 + (start_x_i + (i)) * x_step)
-#define Y(i) (y_1 + (start_y_i + (i)) * y_step)
+#include "cuda_utils.h"
 
 /** Mpi process rank. */
 static int proc_rank = -1;
@@ -32,46 +27,12 @@ static int border_count = -1;
  */
 static int cell_rows = -1;
 static int cell_cols = -1;
-static inline double
-get_cell(double *M, int row, int col)
-{
-	int idx = row * cell_cols + col;
-	assert(idx <= cell_cols * cell_rows);
-	return M[idx];
-}
 
-static inline double *
-get_row(double *M, int row)
-{
-	int idx = row * cell_cols;
-	assert(idx + cell_cols <= cell_cols * cell_rows);
-	return &M[idx];
-}
-
-static inline void
-set_cell(double *M, int row, int col, double value)
-{
-	int idx = row * cell_cols + col;
-	assert(idx <= cell_cols * cell_rows);
-	M[idx] = value;
-}
-
-/**
- * Buffer to send border column. Row can be sent with no buffer,
- * becase matrix rows are stored in a monolitic memory area.
- */
-static double *border_buffer_right = NULL;
-static double *border_buffer_left = NULL;
 /** Sizes of a borders. */
 static int border_size[4];
 /** From with x_i and y_i the current process owns points grid. */
 static int start_x_i = -1;
 static int start_y_i = -1;
-
-/** Indexes to access border arrays. */
-enum {
-	BOTTOM_BORDER, TOP_BORDER, LEFT_BORDER, RIGHT_BORDER
-};
 
 /** True, if a process is on global grid border. */
 static bool is_top = false;
@@ -104,67 +65,41 @@ global_scalar_fraction(double local_numerator, double local_denominator)
 }
 
 /**
- * Calculate global error and increment of P using local error and
- * increment. Global increment is calculated by formula:
+ * Calculate global increment of P using local increment. Global
+ * increment is calculated by formula:
  * || P_i+1 - P_i ||.
  * @param local_increment Local increment of P.
- * @param local_error Local error of P (difference with ethalon).
- * @param[out] global_error Global error over all processes by
- *             formula: || ethalon - P ||.
  * @param step Grid step (step by X * step by Y).
  *
  * @retval Global increment.
  */
 static inline double
-global_increment(double local_increment, double local_error,
-		 double *global_error, double step)
+global_increment(double local_increment, double step)
 {
-	double local_buf[2];
-	double global_buf[2];
-	local_buf[0] = local_increment;
-	local_buf[1] = local_error;
-	int rc = MPI_Allreduce(local_buf, global_buf, 2, MPI_DOUBLE, MPI_SUM,
-			       MPI_COMM_WORLD);
+	double global_increment;
+	int rc = MPI_Allreduce(&local_increment, &global_increment, 1,
+			       MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
 	(void) rc; /* Prune warning in release mode. */
 	assert(rc == MPI_SUCCESS);
-	*global_error = sqrt(global_buf[1] * step);
-	return sqrt(global_buf[0] * step);
+	return sqrt(global_increment * step);
 }
 
 /**
- * Async send borders of @a matrix to a neighbour processes. Each
- * neighbour process will store borders of @a matrix in its
- * P_, R_ or G_neigh array.
- * @param matrix Matrix to send.
+ * Async send borders of a matrix to a neighbour processes. Each
+ * neighbour process will store borders in its P, R or G borders
+ * section.
+ * @param border_buffers Buffers to send.
  */
 static inline void
-send_borders(double *matrix)
+send_borders(const double * const *border_buffers)
 {
 	for (int i = 0; i < 4; ++i) {
 		MPI_Request req;
 		if (ranks_neigh[i] == -1)
 			continue;
-		double *to_send;
-		if (i == BOTTOM_BORDER || i == TOP_BORDER) {
-			if (i == BOTTOM_BORDER)
-				to_send = get_row(matrix, 0);
-			else
-				to_send = get_row(matrix, cell_rows - 1);
-		} else {
-			int col;
-			if (i == LEFT_BORDER) {
-				col = 0;
-				to_send = border_buffer_left;
-			} else {
-				col = cell_cols - 1;
-				to_send = border_buffer_right;
-			}
-			for (int i = 0; i < cell_rows; ++i)
-				to_send[i] = get_cell(matrix, i, col);
-		}
 		int size = border_size[i];
-		int rc = MPI_Isend(to_send, size, MPI_DOUBLE, ranks_neigh[i], i,
-				   MPI_COMM_WORLD, &req);
+		int rc = MPI_Isend(border_buffers[i], size, MPI_DOUBLE,
+				   ranks_neigh[i], i, MPI_COMM_WORLD, &req);
 		(void) rc; /* Prune warning in release mode. */
 		assert(rc == MPI_SUCCESS);
 		MPI_Request_free(&req);
@@ -173,11 +108,11 @@ send_borders(double *matrix)
 
 /**
  * Async receive borders from a neighbour processes.
- * @param borders Borders of a matrix.
+ * @param border_buffers Input border buffers.
  * @param[out] reqs Result array of requests to sync by them.
  */
 static inline void
-receive_borders(double **borders, MPI_Request *reqs)
+receive_borders(double **border_buffers, MPI_Request *reqs)
 {
 	for (int i = 0; i < 4; ++i) {
 		if (ranks_neigh[i] == -1)
@@ -195,8 +130,9 @@ receive_borders(double **borders, MPI_Request *reqs)
 				type_from = LEFT_BORDER;
 		}
 		int size = border_size[i];
-		int rc = MPI_Irecv(borders[i], size, MPI_DOUBLE, ranks_neigh[i],
-				   type_from, MPI_COMM_WORLD, &reqs[i]);
+		int rc = MPI_Irecv(border_buffers[i], size, MPI_DOUBLE,
+				   ranks_neigh[i], type_from, MPI_COMM_WORLD,
+				   &reqs[i]);
 		(void) rc; /* Prune warning in release mode. */
 		assert(rc == MPI_SUCCESS);
 	}
