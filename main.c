@@ -39,6 +39,11 @@ static int last_internal_col = -1;
 /** Border values of neighbour processes. */
 static double *P_neigh[4];
 static double *P = NULL;
+/**
+ * P is the i-th verion of a decision. P_prev is a P (i-1)-th
+ * verion of a decision. Used to dump relative error.
+ */
+static double *P_prev = NULL;
 static double *G_neigh[4];
 static double *G = NULL;
 static double *R_neigh[4];
@@ -50,6 +55,14 @@ static double *matrix_buffer = NULL;
 static int iterations_count = 0;
 /** Maximal iterations count. Useful to see the progress. */
 static const int max_iterations_count = 2000000;
+
+/**
+ * Types of a statistic to dump at the end of iteraion. Can be set
+ * by an user.
+ */
+enum statistics_type {
+	DUMP_DECISION = 1, DUMP_ERROR, DUMP_INCREMENT
+};
 
 /**
  * The algorithm solves the following system:
@@ -316,19 +329,20 @@ create_matrices()
 
 	int max_count = cell_rows > cell_cols ? cell_rows : cell_cols;
 	int size = cell_rows * cell_cols;
-	double *mem = (double *) calloc(size * 4 + max_count * 2,
+	double *mem = (double *) calloc(size * 5 + max_count * 2,
 					sizeof(double));
 	assert(mem != NULL);
 	P = mem;
 	R = mem + size;
 	G = mem + size * 2;
 	matrix_buffer = mem + size * 3;
+	P_prev = mem + size * 4;
 	create_borders(BOTTOM_BORDER, ! is_bottom);
 	create_borders(TOP_BORDER, ! is_top);
 	create_borders(LEFT_BORDER, ! is_left);
 	create_borders(RIGHT_BORDER, ! is_right);
-	border_buffer_left = mem + size * 4;
-	border_buffer_right = mem + size * 4 + max_count;
+	border_buffer_left = mem + size * 5;
+	border_buffer_right = mem + size * 5 + max_count;
 
 	if (is_bottom) {
 		for (int i = 0; i < cell_cols; ++i)
@@ -462,6 +476,7 @@ calculate()
 		/* (4) */
 		double tau = global_scalar_fraction(numerator, denominator);
 
+		memcpy(P_prev, P, cell_rows * cell_cols);
 		/* (5) */
 		double local_inc = calculate_next_P(tau, G, G_neigh,
 						    &local_error);
@@ -473,6 +488,96 @@ calculate()
 		}
 	}
 	printf("finished in %d iterations\n", iterations_count);
+}
+
+/**
+ * Dump an absolute error into a file with a name
+ * 'P_vers<iterations_count>_proc<proc_id>'.
+ * The error is dumped as a matrix of absolute differences of P
+ * and ethalon decision.
+ */
+static void
+dump_error()
+{
+	char filename[1024];
+	snprintf(filename, sizeof(filename), "P_vers%02d_proc%05d",
+		 iterations_count, proc_rank);
+	FILE *f = fopen(filename, "w");
+	assert(f != NULL);
+	fprintf(f, "[[");
+	for (int i = 0; i < cell_rows; ++i) {
+		for (int j = 0; j < cell_cols; ++j)
+			if (i + 1 != cell_rows || j + 1 != cell_cols)
+				fprintf(f, "%lf, ", X(j));
+			else
+				fprintf(f, "%lf", X(j));
+	}
+	fprintf(f, "],[\n");
+	for (int i = 0; i < cell_rows; ++i) {
+		for (int j = 0; j < cell_cols; ++j)
+			if (i + 1 != cell_rows || j + 1 != cell_cols)
+				fprintf(f, "%lf, ", Y(i));
+			else
+				fprintf(f, "%lf", Y(i));
+	}
+	fprintf(f, "],[\n");
+	for (int i = 0; i < cell_rows; ++i) {
+		for (int j = 0; j < cell_cols; ++j) {
+			double val = fabs(get_cell(P, i, j) -
+					  ethalon(X(j), Y(i)));
+			if (i + 1 != cell_rows || j + 1 != cell_cols)
+				fprintf(f, "%lf, ", val);
+			else
+				fprintf(f, "%lf", val);
+		}
+	}
+	fprintf(f, "]]");
+	fclose(f);
+}
+
+/**
+ * Dump an relative error into a file with a name
+ * 'P_vers<iterations_count>_proc<proc_id>'.
+ * The error is dumped as a matrix of absolute differences of a
+ * final P and a previous one.
+ */
+static void
+dump_increment()
+{
+	char filename[1024];
+	snprintf(filename, sizeof(filename), "P_vers%02d_proc%05d",
+		 iterations_count, proc_rank);
+	FILE *f = fopen(filename, "w");
+	assert(f != NULL);
+	fprintf(f, "[[");
+	for (int i = 0; i < cell_rows; ++i) {
+		for (int j = 0; j < cell_cols; ++j)
+			if (i + 1 != cell_rows || j + 1 != cell_cols)
+				fprintf(f, "%lf, ", X(j));
+			else
+				fprintf(f, "%lf", X(j));
+	}
+	fprintf(f, "],[\n");
+	for (int i = 0; i < cell_rows; ++i) {
+		for (int j = 0; j < cell_cols; ++j)
+			if (i + 1 != cell_rows || j + 1 != cell_cols)
+				fprintf(f, "%lf, ", Y(i));
+			else
+				fprintf(f, "%lf", Y(i));
+	}
+	fprintf(f, "],[\n");
+	for (int i = 0; i < cell_rows; ++i) {
+		for (int j = 0; j < cell_cols; ++j) {
+			double val = fabs(get_cell(P, i, j) -
+					  get_cell(P_prev, i, j));
+			if (i + 1 != cell_rows || j + 1 != cell_cols)
+				fprintf(f, "%lf, ", val);
+			else
+				fprintf(f, "%lf", val);
+		}
+	}
+	fprintf(f, "]]");
+	fclose(f);
 }
 
 /**
@@ -548,6 +653,7 @@ int
 main(int argc, char **argv)
 {
 	int table_height, table_width;
+	enum statistics_type stat = DUMP_DECISION;
 	if (argc >= 3) {
 		table_height = atoi(argv[1]);
 		if (table_height == 0) {
@@ -558,6 +664,13 @@ main(int argc, char **argv)
 		if (table_width == 0) {
 			printf("Incorrect table width\n");
 			return -1;
+		}
+		if (argc >= 4) {
+			int istat = atoi(argv[3]);
+			if (istat >= 1 && istat <= 3)
+				stat = (enum statistics_type)istat;
+			else
+				printf("Warning: unknown statistics type\n");
 		}
 	} else {
 		table_height = 1000;
@@ -599,7 +712,16 @@ main(int argc, char **argv)
 	if (proc_rank == 0)
 		printf("time = %lf\n", end_time - start_time);
 
-	dump_matrix(P, "P", NULL);
+	if (stat == DUMP_DECISION) {
+		printf("Dump decision\n");
+		dump_matrix(P, "P", NULL);
+	} else if (stat == DUMP_INCREMENT) {
+		printf("Dump increment\n");
+		dump_increment();
+	} else if (stat == DUMP_ERROR) {
+		printf("Dump error\n");
+		dump_error();
+	}
 
 	free(P);
 	for (int i = 0; i < 4; ++i)
